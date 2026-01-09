@@ -1,3 +1,4 @@
+// Gmail Acknowledgement Reply Bot (Apps Script)
 const ACK_BOT_CONFIG = {
   targetToEmail: 'team-leader@companyname.com',
   fromDomainQuery: 'from:companyname.com',
