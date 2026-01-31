@@ -1,0 +1,22 @@
+{
+  "name": "slack-reaction-mirror",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mirror existing Slack message reactions by adding the same emoji reactions from your own account (user token).",
+  "scripts": {
+    "start": "node --import tsx ./src/slack-reaction-mirror.ts",
+    "watch": "node --import tsx ./src/slack-reaction-mirror-watch.ts",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.9.1",
+    "@slack/socket-mode": "^2.0.5",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.3.3"
+  }
+}
