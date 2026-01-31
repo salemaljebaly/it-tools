@@ -4,6 +4,8 @@ Mirrors reactions on messages in a Slack channel by adding the same emoji reacti
 
 This uses a **Slack user token** (not a bot token), so the reaction is shown as created by *you*.
 
+For an admin/install request doc (scopes, events, Socket Mode), see `REQUEST.md`.
+
 ## Setup (Slack app)
 
 Create a Slack app and enable OAuth **User Token** scopes (OAuth & Permissions):
