@@ -59,13 +59,14 @@ npm run start -- --channel G12345678 --oldest 2026-01-29
 - `--oldest <ISO|epoch_seconds>` start time (inclusive)
 - `--latest <ISO|epoch_seconds>` end time (inclusive)
 - `--include-thread-replies` also process thread replies (slower)
+- `--add-default-reactions` if a message has no reactions yet, add default reactions (`rocket`, `raised_hands`, `saluting_face`, `v`). Optionally override via `SLACK_DEFAULT_REACTIONS`
 - `--dry-run` log actions without adding reactions
 - `--max-messages <N>` stop after processing N messages
 - `--max-adds <N>` stop after attempting N reaction adds
 
 ## Behavior
 
-- Skips messages with no reactions.
+- By default skips messages with no reactions. With `--add-default-reactions`, it will add default reactions to messages that have none.
 - For each emoji reaction on a message, if you have not reacted yet, it adds that emoji reaction from your account.
 - Skips mirroring reactions onto messages authored by you.
 - For Workflow Builder / app-posted standups, it can also skip messages that *mention you* (`<@U...>`) or match `SLACK_SKIP_MESSAGE_REGEX` / `SLACK_SKIP_MESSAGE_CONTAINS`.
