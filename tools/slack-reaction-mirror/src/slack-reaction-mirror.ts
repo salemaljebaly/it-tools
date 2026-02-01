@@ -7,9 +7,12 @@ type ArgSpec = {
   latest?: string;
   includeThreadReplies: boolean;
   dryRun: boolean;
+  addDefaultReactions: boolean;
   maxMessages?: number;
   maxReactionsAdds?: number;
 };
+
+const BUILTIN_DEFAULT_REACTIONS = ["rocket", "raised_hands", "saluting_face", "v"] as const;
 
 function optionalEnv(name: string): string | undefined {
   const v = process.env[name];
@@ -69,6 +72,7 @@ function usage(): string {
     "  --oldest <ISO|epoch_seconds>     Start time (inclusive). Example: 2026-01-01 or 1735689600",
     "  --latest <ISO|epoch_seconds>     End time (inclusive). Example: 2026-01-31 or 1738281600",
     "  --include-thread-replies         Also process thread replies (slower)",
+    "  --add-default-reactions          If a message has no reactions yet, add default reactions (rocket, raised_hands, saluting_face, v)",
     "  --dry-run                        Log actions without adding reactions",
     "  --max-messages <N>               Stop after processing N messages",
     "  --max-adds <N>                   Stop after attempting N reaction adds",
@@ -80,6 +84,7 @@ function usage(): string {
     "  SLACK_SKIP_MESSAGE_REGEX         Optional regex (case-insensitive) to skip messages (useful for Workflow Builder posts)",
     "  SLACK_SKIP_MESSAGE_CONTAINS      Optional comma-separated substrings to skip messages (case-insensitive)",
     "  SLACK_DEBUG_SKIP                 Optional: set to 1 to log why messages are skipped",
+    "  SLACK_DEFAULT_REACTIONS          Optional comma-separated emoji names to use with --add-default-reactions",
     "",
     "Example:",
     "  cp .env.example .env",
@@ -92,6 +97,7 @@ function parseArgs(argv: string[]): ArgSpec {
   const spec: ArgSpec = {
     includeThreadReplies: false,
     dryRun: false,
+    addDefaultReactions: false,
   };
 
   const takeValue = (i: number): string => {
@@ -119,6 +125,10 @@ function parseArgs(argv: string[]): ArgSpec {
     }
     if (a === "--include-thread-replies") {
       spec.includeThreadReplies = true;
+      continue;
+    }
+    if (a === "--add-default-reactions") {
+      spec.addDefaultReactions = true;
       continue;
     }
     if (a === "--dry-run") {
@@ -333,6 +343,59 @@ async function mirrorReactionsForMessage(opts: {
   return { added, skippedAlreadyReacted, skippedOwnMessage: 0 };
 }
 
+async function addDefaultReactionsForMessage(opts: {
+  client: WebClient;
+  channel: string;
+  messageTs: string;
+  defaultReactionNames: string[];
+  skipCfg: SkipConfig;
+  dryRun: boolean;
+}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number; skippedHasReactions: number }> {
+  const { client, channel, messageTs, defaultReactionNames, skipCfg, dryRun } = opts;
+
+  const res = await withRateLimitRetry(() => client.reactions.get({ channel, timestamp: messageTs, full: true }));
+  const message = res.message as
+    | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
+    | undefined;
+  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 0 };
+
+  const skip = shouldSkipMessage(message, skipCfg);
+  if (skip.skip) {
+    if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedHasReactions: 0 };
+  }
+
+  if (message.reactions && message.reactions.length > 0) {
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 1 };
+  }
+
+  let added = 0;
+  let skippedAlreadyReacted = 0;
+
+  for (const name of defaultReactionNames) {
+    if (dryRun) {
+      console.log(`[dry-run] add default :${name}: to ${channel} @ ${messageTs}`);
+      added += 1;
+      continue;
+    }
+
+    try {
+      await withRateLimitRetry(() => client.reactions.add({ name, channel, timestamp: messageTs }));
+      console.log(`added default :${name}: to ${channel} @ ${messageTs}`);
+      added += 1;
+    } catch (err) {
+      const anyErr = err as { data?: { error?: string } };
+      if (anyErr?.data?.error === "already_reacted") {
+        skippedAlreadyReacted += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedHasReactions: 0 };
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
   const channel = args.channel || process.env.SLACK_CHANNEL_ID;
@@ -383,6 +446,11 @@ async function main(): Promise<void> {
   const skipMessageRegex = skipMessageRegexStr ? new RegExp(skipMessageRegexStr, "i") : undefined;
   const debugSkip = optionalEnv("SLACK_DEBUG_SKIP") === "1";
 
+  const envDefaultReactions = parseCommaList(optionalEnv("SLACK_DEFAULT_REACTIONS"));
+  const defaultReactionNames = (
+    envDefaultReactions.length > 0 ? envDefaultReactions : [...BUILTIN_DEFAULT_REACTIONS]
+  ).filter((v, i, arr) => arr.indexOf(v) === i);
+
   const skipCfg: SkipConfig = {
     skipUserId,
     skipUserAliases: [...baseAliases, ...userInfoAliases].filter((v, i, arr) => arr.indexOf(v) === i),
@@ -399,6 +467,7 @@ async function main(): Promise<void> {
       oldest ? `oldest=${oldest}` : undefined,
       latest ? `latest=${latest}` : undefined,
       args.includeThreadReplies ? "includeThreadReplies=true" : undefined,
+      args.addDefaultReactions ? `addDefaultReactions=${defaultReactionNames.join(",")}` : undefined,
       args.dryRun ? "dryRun=true" : undefined,
     ]
       .filter(Boolean)
@@ -410,6 +479,7 @@ async function main(): Promise<void> {
   let totalAdds = 0;
   let totalSkipped = 0;
   let totalSkippedOwn = 0;
+  let totalSkippedHasReactions = 0;
 
   do {
     const res = await withRateLimitRetry(() =>
@@ -438,6 +508,28 @@ async function main(): Promise<void> {
       const isOwnMessage = shouldSkipMessage(message, skipCfg).skip;
 
       if (!message.reactions || message.reactions.length === 0) {
+        if (args.addDefaultReactions && !isOwnMessage) {
+          const r0 = await addDefaultReactionsForMessage({
+            client,
+            channel,
+            messageTs: message.ts,
+            defaultReactionNames,
+            skipCfg,
+            dryRun: args.dryRun,
+          });
+          totalAdds += r0.added;
+          totalSkipped += r0.skippedAlreadyReacted;
+          totalSkippedOwn += r0.skippedOwnMessage;
+          totalSkippedHasReactions += r0.skippedHasReactions;
+
+          if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
+            cursor = undefined;
+            break;
+          }
+        } else if (isOwnMessage) {
+          totalSkippedOwn += 1;
+        }
+
         if (args.includeThreadReplies && message.reply_count && message.reply_count > 0) {
           const replies = await listThreadReplies(client, channel, message.ts);
           for (const reply of replies) {
@@ -447,7 +539,28 @@ async function main(): Promise<void> {
               totalSkippedOwn += 1;
               continue; // skip reacting on our own messages
             }
-            if (!reply.reactions || reply.reactions.length === 0) continue;
+            if (!reply.reactions || reply.reactions.length === 0) {
+              if (args.addDefaultReactions) {
+                const r1 = await addDefaultReactionsForMessage({
+                  client,
+                  channel,
+                  messageTs: reply.ts,
+                  defaultReactionNames,
+                  skipCfg,
+                  dryRun: args.dryRun,
+                });
+                totalAdds += r1.added;
+                totalSkipped += r1.skippedAlreadyReacted;
+                totalSkippedOwn += r1.skippedOwnMessage;
+                totalSkippedHasReactions += r1.skippedHasReactions;
+
+                if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
+                  cursor = undefined;
+                  break;
+                }
+              }
+              continue;
+            }
 
             const r = await mirrorReactionsForMessage({
               client,
@@ -495,7 +608,28 @@ async function main(): Promise<void> {
             totalSkippedOwn += 1;
             continue; // skip reacting on our own messages
           }
-          if (!reply.reactions || reply.reactions.length === 0) continue;
+          if (!reply.reactions || reply.reactions.length === 0) {
+            if (args.addDefaultReactions) {
+              const r1 = await addDefaultReactionsForMessage({
+                client,
+                channel,
+                messageTs: reply.ts,
+                defaultReactionNames,
+                skipCfg,
+                dryRun: args.dryRun,
+              });
+              totalAdds += r1.added;
+              totalSkipped += r1.skippedAlreadyReacted;
+              totalSkippedOwn += r1.skippedOwnMessage;
+              totalSkippedHasReactions += r1.skippedHasReactions;
+
+              if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
+                cursor = undefined;
+                break;
+              }
+            }
+            continue;
+          }
 
           const rr = await mirrorReactionsForMessage({
             client,
@@ -524,7 +658,7 @@ async function main(): Promise<void> {
   } while (cursor);
 
   console.log(
-    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn}`,
+    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn} skipped_has_reactions=${totalSkippedHasReactions}`,
   );
 }
 
