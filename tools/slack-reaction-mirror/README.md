@@ -36,6 +36,8 @@ Then edit `.env`:
 - Always set `SLACK_USER_TOKEN`
 - For live mode (`npm run watch`), also set `SLACK_APP_TOKEN`
 - Optionally set `SLACK_CHANNEL_ID` to limit to one channel
+- Optionally set `SLACK_MY_USER_ID` to skip reacting on messages authored by you
+- For Workflow Builder messages posted by an app user, optionally set `SLACK_SKIP_MESSAGE_REGEX` or `SLACK_SKIP_MESSAGE_CONTAINS` to skip “your” messages based on content (e.g. a `from:` line).
 
 ## Run
 
@@ -65,6 +67,8 @@ npm run start -- --channel G12345678 --oldest 2026-01-29
 
 - Skips messages with no reactions.
 - For each emoji reaction on a message, if you have not reacted yet, it adds that emoji reaction from your account.
+- Skips mirroring reactions onto messages authored by you.
+- For Workflow Builder / app-posted standups, it can also skip messages that *mention you* (`<@U...>`) or match `SLACK_SKIP_MESSAGE_REGEX` / `SLACK_SKIP_MESSAGE_CONTAINS`.
 - Handles Slack rate limits (429) by sleeping and retrying.
 
 ## Run continuously (best)

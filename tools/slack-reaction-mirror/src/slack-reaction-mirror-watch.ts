@@ -10,7 +10,49 @@ function requiredEnv(name: string): string {
 
 function optionalEnv(name: string): string | undefined {
   const v = process.env[name];
-  return v && v.trim().length > 0 ? v : undefined;
+  if (!v) return undefined;
+  const trimmed = v.trim();
+  if (trimmed.length === 0) return undefined;
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"") && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseCommaList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function escapeRegexLiteral(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function collectStrings(value: unknown, out: string[], opts: { maxDepth: number; maxStrings: number }): void {
+  if (out.length >= opts.maxStrings) return;
+  if (value === null || value === undefined) return;
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (opts.maxDepth <= 0) return;
+  if (typeof value !== "object") return;
+
+  if (Array.isArray(value)) {
+    for (const v of value) collectStrings(v, out, { ...opts, maxDepth: opts.maxDepth - 1 });
+    return;
+  }
+
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    collectStrings(v, out, { ...opts, maxDepth: opts.maxDepth - 1 });
+    if (out.length >= opts.maxStrings) return;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -45,23 +87,129 @@ type ReactionAddedEvent = {
   type: "reaction_added";
   user: string;
   reaction: string;
+  item_user?: string;
   item: { type: string; channel?: string; ts?: string };
 };
+
+type SkipConfig = {
+  skipUserId: string;
+  skipUserAliases: string[];
+  skipMessageRegex?: RegExp;
+  skipMessageContains: string[];
+  debugSkip: boolean;
+};
+
+function messageContentStrings(message: unknown): string[] {
+  const out: string[] = [];
+  collectStrings(message, out, { maxDepth: 8, maxStrings: 600 });
+  return out;
+}
+
+function matchesWorkflowFromLineMention(strings: string[], userId: string): boolean {
+  const re = new RegExp(`from\\s*:\\s*<@${escapeRegexLiteral(userId)}>`, "i");
+  return strings.some((s) => re.test(s));
+}
+
+function matchesWorkflowFromLine(strings: string[], aliases: string[]): boolean {
+  for (const alias of aliases) {
+    const re = new RegExp(`from\\s*:\\s*@?\\s*${escapeRegexLiteral(alias)}\\b`, "i");
+    if (strings.some((s) => re.test(s))) return true;
+  }
+  return false;
+}
+
+function shouldSkipMessage(message: unknown, cfg: SkipConfig): { skip: boolean; reason?: string } {
+  if (typeof message === "object" && message !== null) {
+    const anyMsg = message as { user?: unknown };
+    if (typeof anyMsg.user === "string" && anyMsg.user === cfg.skipUserId) return { skip: true, reason: "author_user_id" };
+  }
+
+  const strings = messageContentStrings(message);
+  if (matchesWorkflowFromLineMention(strings, cfg.skipUserId)) return { skip: true, reason: "workflow_from_line_user_id" };
+  if (matchesWorkflowFromLine(strings, cfg.skipUserAliases)) return { skip: true, reason: "workflow_from_line_alias" };
+
+  if (cfg.skipMessageContains.length > 0) {
+    const lowerStrings = strings.map((s) => s.toLowerCase());
+    for (const contains of cfg.skipMessageContains) {
+      const needle = contains.toLowerCase();
+      if (lowerStrings.some((s) => s.includes(needle))) return { skip: true, reason: "skip_contains" };
+    }
+  }
+
+  if (cfg.skipMessageRegex && strings.some((s) => cfg.skipMessageRegex!.test(s))) return { skip: true, reason: "skip_regex" };
+
+  return { skip: false };
+}
+
+async function getMessage(web: WebClient, channel: string, ts: string): Promise<unknown | undefined> {
+  const res = await withRateLimitRetry(() =>
+    web.conversations.history({
+      channel,
+      oldest: ts,
+      latest: ts,
+      inclusive: true,
+      limit: 1,
+    }),
+  );
+  return res.messages?.[0];
+}
 
 async function main(): Promise<void> {
   const slackUserToken = requiredEnv("SLACK_USER_TOKEN");
   const slackAppToken = requiredEnv("SLACK_APP_TOKEN"); // xapp-...
   const filterChannelId = optionalEnv("SLACK_CHANNEL_ID");
+  const configuredMyUserId = optionalEnv("SLACK_MY_USER_ID");
+  const skipMessageContains = parseCommaList(optionalEnv("SLACK_SKIP_MESSAGE_CONTAINS"));
+  const skipMessageRegexStr = optionalEnv("SLACK_SKIP_MESSAGE_REGEX");
+  const skipMessageRegex = skipMessageRegexStr ? new RegExp(skipMessageRegexStr, "i") : undefined;
+  const debugSkip = optionalEnv("SLACK_DEBUG_SKIP") === "1";
 
   const web = new WebClient(slackUserToken);
   const auth = await withRateLimitRetry(() => web.auth.test());
-  const myUserId = auth.user_id;
-  if (!myUserId) throw new Error("Could not determine user_id from auth.test()");
+  const authedUserId = auth.user_id;
+  const authedUserName = typeof auth.user === "string" ? auth.user : undefined;
+  if (!authedUserId) throw new Error("Could not determine user_id from auth.test()");
+
+  const skipUserId = configuredMyUserId ?? authedUserId;
+  if (configuredMyUserId && configuredMyUserId !== authedUserId) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `SLACK_MY_USER_ID=${configuredMyUserId} does not match token user_id=${authedUserId}; using SLACK_MY_USER_ID only for skip logic`,
+    );
+  }
+
+  const baseAliases =
+    skipUserId === authedUserId && authedUserName ? [authedUserName, `@${authedUserName}`] : [];
+  let userInfoAliases: string[] = [];
+  try {
+    const userInfo = await withRateLimitRetry(() => web.users.info({ user: skipUserId }));
+    const u = userInfo.user as
+      | { name?: unknown; real_name?: unknown; profile?: { display_name?: unknown; real_name?: unknown } }
+      | undefined;
+    const maybe = [
+      typeof u?.name === "string" ? u.name : undefined,
+      typeof u?.real_name === "string" ? u.real_name : undefined,
+      typeof u?.profile?.display_name === "string" ? u.profile.display_name : undefined,
+      typeof u?.profile?.real_name === "string" ? u.profile.real_name : undefined,
+    ].filter((s): s is string => Boolean(s && s.trim().length > 0));
+    userInfoAliases = maybe.flatMap((s) => [s, `@${s}`]);
+  } catch {
+    // ignore; requires users:read in some workspaces
+  }
+
+  const skipCfg: SkipConfig = {
+    skipUserId,
+    skipUserAliases: [...baseAliases, ...userInfoAliases].filter((v, i, arr) => arr.indexOf(v) === i),
+    skipMessageRegex,
+    skipMessageContains,
+    debugSkip,
+  };
 
   // eslint-disable-next-line no-console
   console.log(
     [
-      `watching as user=${myUserId}`,
+      `watching as user=${authedUserId}`,
+      skipUserId !== authedUserId ? `skipUser=${skipUserId}` : undefined,
       filterChannelId ? `channelFilter=${filterChannelId}` : "channelFilter=none",
     ].join(" "),
   );
@@ -81,10 +229,24 @@ async function main(): Promise<void> {
     const reactingUser = event.user;
 
     if (!channel || !ts || !reaction || !reactingUser) return;
-    if (reactingUser === myUserId) return; // prevent loops: ignore our own adds
+    if (reactingUser === authedUserId) return; // prevent loops: ignore our own adds
     if (filterChannelId && channel !== filterChannelId) return;
 
     try {
+      const authorId = event.item_user;
+      if (authorId === skipCfg.skipUserId) {
+        if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${ts} reason=item_user`);
+        return; // skip reacting on our own messages
+      }
+
+      const message = await getMessage(web, channel, ts);
+      if (!message) return;
+      const skip = shouldSkipMessage(message, skipCfg);
+      if (skip.skip) {
+        if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${ts} reason=${skip.reason ?? "unknown"}`);
+        return;
+      }
+
       await withRateLimitRetry(() => web.reactions.add({ name: reaction, channel, timestamp: ts }));
       // eslint-disable-next-line no-console
       console.log(`added :${reaction}: to ${channel} @ ${ts}`);
@@ -106,4 +268,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

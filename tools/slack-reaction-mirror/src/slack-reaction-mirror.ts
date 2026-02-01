@@ -11,6 +11,53 @@ type ArgSpec = {
   maxReactionsAdds?: number;
 };
 
+function optionalEnv(name: string): string | undefined {
+  const v = process.env[name];
+  if (!v) return undefined;
+  const trimmed = v.trim();
+  if (trimmed.length === 0) return undefined;
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"") && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseCommaList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function escapeRegexLiteral(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function collectStrings(value: unknown, out: string[], opts: { maxDepth: number; maxStrings: number }): void {
+  if (out.length >= opts.maxStrings) return;
+  if (value === null || value === undefined) return;
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (opts.maxDepth <= 0) return;
+  if (typeof value !== "object") return;
+
+  if (Array.isArray(value)) {
+    for (const v of value) collectStrings(v, out, { ...opts, maxDepth: opts.maxDepth - 1 });
+    return;
+  }
+
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    collectStrings(v, out, { ...opts, maxDepth: opts.maxDepth - 1 });
+    if (out.length >= opts.maxStrings) return;
+  }
+}
+
 function usage(): string {
   return [
     "Slack reaction mirror (add same reactions as others, using your user token)",
@@ -29,6 +76,10 @@ function usage(): string {
     "Env:",
     "  SLACK_USER_TOKEN                 Slack user token (xoxp-... or xoxc-...)",
     "  SLACK_CHANNEL_ID                 Optional default channel ID if --channel is omitted",
+    "  SLACK_MY_USER_ID                 Optional: your Slack user ID (U...). Used to skip reacting on your own messages",
+    "  SLACK_SKIP_MESSAGE_REGEX         Optional regex (case-insensitive) to skip messages (useful for Workflow Builder posts)",
+    "  SLACK_SKIP_MESSAGE_CONTAINS      Optional comma-separated substrings to skip messages (case-insensitive)",
+    "  SLACK_DEBUG_SKIP                 Optional: set to 1 to log why messages are skipped",
     "",
     "Example:",
     "  cp .env.example .env",
@@ -141,10 +192,65 @@ async function withRateLimitRetry<T>(fn: () => Promise<T>): Promise<T> {
 
 type SlackMessage = {
   ts: string;
+  user?: string;
+  text?: string;
   subtype?: string;
   reactions?: Array<{ name: string; count: number }>;
   reply_count?: number;
 };
+
+type SkipConfig = {
+  skipUserId: string;
+  skipUserAliases: string[];
+  skipMessageRegex?: RegExp;
+  skipMessageContains: string[];
+  debugSkip: boolean;
+};
+
+function messageContentStrings(message: unknown): string[] {
+  const out: string[] = [];
+  collectStrings(message, out, { maxDepth: 8, maxStrings: 600 });
+  return out;
+}
+
+function matchesWorkflowFromLineMention(strings: string[], userId: string): boolean {
+  const re = new RegExp(`from\\s*:\\s*<@${escapeRegexLiteral(userId)}>`, "i");
+  return strings.some((s) => re.test(s));
+}
+
+function matchesWorkflowFromLine(strings: string[], aliases: string[]): boolean {
+  for (const alias of aliases) {
+    const re = new RegExp(`from\\s*:\\s*@?\\s*${escapeRegexLiteral(alias)}\\b`, "i");
+    if (strings.some((s) => re.test(s))) return true;
+  }
+  return false;
+}
+
+function shouldSkipMessage(message: unknown, cfg: SkipConfig): { skip: boolean; reason?: string } {
+  if (typeof message === "object" && message !== null) {
+    const anyMsg = message as { user?: unknown };
+    if (typeof anyMsg.user === "string" && anyMsg.user === cfg.skipUserId) return { skip: true, reason: "author_user_id" };
+  }
+
+  const strings = messageContentStrings(message);
+
+  if (matchesWorkflowFromLineMention(strings, cfg.skipUserId)) return { skip: true, reason: "workflow_from_line_user_id" };
+
+  // Workflow Builder / apps often embed a "from:" line; match against known aliases.
+  if (matchesWorkflowFromLine(strings, cfg.skipUserAliases)) return { skip: true, reason: "workflow_from_line_alias" };
+
+  if (cfg.skipMessageContains.length > 0) {
+    const lowerStrings = strings.map((s) => s.toLowerCase());
+    for (const contains of cfg.skipMessageContains) {
+      const needle = contains.toLowerCase();
+      if (lowerStrings.some((s) => s.includes(needle))) return { skip: true, reason: "skip_contains" };
+    }
+  }
+
+  if (cfg.skipMessageRegex && strings.some((s) => cfg.skipMessageRegex!.test(s))) return { skip: true, reason: "skip_regex" };
+
+  return { skip: false };
+}
 
 async function listThreadReplies(client: WebClient, channel: string, threadTs: string): Promise<SlackMessage[]> {
   const replies: SlackMessage[] = [];
@@ -170,15 +276,26 @@ async function mirrorReactionsForMessage(opts: {
   client: WebClient;
   channel: string;
   messageTs: string;
-  myUserId: string;
+  authedUserId: string;
+  skipCfg: SkipConfig;
   dryRun: boolean;
-}): Promise<{ added: number; skippedAlreadyReacted: number }> {
-  const { client, channel, messageTs, myUserId, dryRun } = opts;
+}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number }> {
+  const { client, channel, messageTs, authedUserId, skipCfg, dryRun } = opts;
 
   const res = await withRateLimitRetry(() => client.reactions.get({ channel, timestamp: messageTs, full: true }));
-  const message = res.message as { reactions?: Array<{ name: string; users?: string[] }> } | undefined;
+  const message = res.message as
+    | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
+    | undefined;
+  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1 };
+
+  const skip = shouldSkipMessage(message, skipCfg);
+  if (skip.skip) {
+    if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1 };
+  }
+
   const reactions = message?.reactions ?? [];
-  if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0 };
+  if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0 };
 
   let added = 0;
   let skippedAlreadyReacted = 0;
@@ -188,7 +305,7 @@ async function mirrorReactionsForMessage(opts: {
     if (!name) continue;
 
     const users = reaction.users ?? [];
-    if (users.includes(myUserId)) {
+    if (users.includes(authedUserId)) {
       skippedAlreadyReacted += 1;
       continue;
     }
@@ -213,7 +330,7 @@ async function mirrorReactionsForMessage(opts: {
     }
   }
 
-  return { added, skippedAlreadyReacted };
+  return { added, skippedAlreadyReacted, skippedOwnMessage: 0 };
 }
 
 async function main(): Promise<void> {
@@ -230,12 +347,54 @@ async function main(): Promise<void> {
 
   const client = new WebClient(token);
   const auth = await withRateLimitRetry(() => client.auth.test());
-  const myUserId = auth.user_id;
-  if (!myUserId) throw new Error("Could not determine user_id from auth.test()");
+  const authedUserId = auth.user_id;
+  const authedUserName = typeof auth.user === "string" ? auth.user : undefined;
+  if (!authedUserId) throw new Error("Could not determine user_id from auth.test()");
+
+  const configuredSkipUserId = optionalEnv("SLACK_MY_USER_ID");
+  const skipUserId = configuredSkipUserId ?? authedUserId;
+  if (configuredSkipUserId && configuredSkipUserId !== authedUserId) {
+    console.warn(
+      `SLACK_MY_USER_ID=${configuredSkipUserId} does not match token user_id=${authedUserId}; using SLACK_MY_USER_ID only for skip logic`,
+    );
+  }
+
+  const baseAliases =
+    skipUserId === authedUserId && authedUserName ? [authedUserName, `@${authedUserName}`] : [];
+  let userInfoAliases: string[] = [];
+  try {
+    const userInfo = await withRateLimitRetry(() => client.users.info({ user: skipUserId }));
+    const u = userInfo.user as
+      | { name?: unknown; real_name?: unknown; profile?: { display_name?: unknown; real_name?: unknown } }
+      | undefined;
+    const maybe = [
+      typeof u?.name === "string" ? u.name : undefined,
+      typeof u?.real_name === "string" ? u.real_name : undefined,
+      typeof u?.profile?.display_name === "string" ? u.profile.display_name : undefined,
+      typeof u?.profile?.real_name === "string" ? u.profile.real_name : undefined,
+    ].filter((s): s is string => Boolean(s && s.trim().length > 0));
+    userInfoAliases = maybe.flatMap((s) => [s, `@${s}`]);
+  } catch {
+    // ignore; requires users:read in some workspaces
+  }
+
+  const skipMessageContains = parseCommaList(optionalEnv("SLACK_SKIP_MESSAGE_CONTAINS"));
+  const skipMessageRegexStr = optionalEnv("SLACK_SKIP_MESSAGE_REGEX");
+  const skipMessageRegex = skipMessageRegexStr ? new RegExp(skipMessageRegexStr, "i") : undefined;
+  const debugSkip = optionalEnv("SLACK_DEBUG_SKIP") === "1";
+
+  const skipCfg: SkipConfig = {
+    skipUserId,
+    skipUserAliases: [...baseAliases, ...userInfoAliases].filter((v, i, arr) => arr.indexOf(v) === i),
+    skipMessageRegex,
+    skipMessageContains,
+    debugSkip,
+  };
 
   console.log(
     [
-      `user=${myUserId}`,
+      `user=${authedUserId}`,
+      skipUserId !== authedUserId ? `skipUser=${skipUserId}` : undefined,
       `channel=${channel}`,
       oldest ? `oldest=${oldest}` : undefined,
       latest ? `latest=${latest}` : undefined,
@@ -250,6 +409,7 @@ async function main(): Promise<void> {
   let processedMessages = 0;
   let totalAdds = 0;
   let totalSkipped = 0;
+  let totalSkippedOwn = 0;
 
   do {
     const res = await withRateLimitRetry(() =>
@@ -275,23 +435,31 @@ async function main(): Promise<void> {
         break;
       }
 
+      const isOwnMessage = shouldSkipMessage(message, skipCfg).skip;
+
       if (!message.reactions || message.reactions.length === 0) {
         if (args.includeThreadReplies && message.reply_count && message.reply_count > 0) {
           const replies = await listThreadReplies(client, channel, message.ts);
           for (const reply of replies) {
             if (!reply.ts) continue;
             if (reply.ts === message.ts) continue;
+            if (shouldSkipMessage(reply, skipCfg).skip) {
+              totalSkippedOwn += 1;
+              continue; // skip reacting on our own messages
+            }
             if (!reply.reactions || reply.reactions.length === 0) continue;
 
             const r = await mirrorReactionsForMessage({
               client,
               channel,
               messageTs: reply.ts,
-              myUserId,
+              authedUserId,
+              skipCfg,
               dryRun: args.dryRun,
             });
             totalAdds += r.added;
             totalSkipped += r.skippedAlreadyReacted;
+            totalSkippedOwn += r.skippedOwnMessage;
 
             if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
               cursor = undefined;
@@ -302,32 +470,44 @@ async function main(): Promise<void> {
         continue;
       }
 
-      const r = await mirrorReactionsForMessage({
-        client,
-        channel,
-        messageTs: message.ts,
-        myUserId,
-        dryRun: args.dryRun,
-      });
-      totalAdds += r.added;
-      totalSkipped += r.skippedAlreadyReacted;
+      if (!isOwnMessage) {
+        const r = await mirrorReactionsForMessage({
+          client,
+          channel,
+          messageTs: message.ts,
+          authedUserId,
+          skipCfg,
+          dryRun: args.dryRun,
+        });
+        totalAdds += r.added;
+        totalSkipped += r.skippedAlreadyReacted;
+        totalSkippedOwn += r.skippedOwnMessage;
+      } else {
+        totalSkippedOwn += 1;
+      }
 
       if (args.includeThreadReplies && message.reply_count && message.reply_count > 0) {
         const replies = await listThreadReplies(client, channel, message.ts);
         for (const reply of replies) {
           if (!reply.ts) continue;
           if (reply.ts === message.ts) continue;
+          if (shouldSkipMessage(reply, skipCfg).skip) {
+            totalSkippedOwn += 1;
+            continue; // skip reacting on our own messages
+          }
           if (!reply.reactions || reply.reactions.length === 0) continue;
 
           const rr = await mirrorReactionsForMessage({
             client,
             channel,
             messageTs: reply.ts,
-            myUserId,
+            authedUserId,
+            skipCfg,
             dryRun: args.dryRun,
           });
           totalAdds += rr.added;
           totalSkipped += rr.skippedAlreadyReacted;
+          totalSkippedOwn += rr.skippedOwnMessage;
 
           if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
             cursor = undefined;
@@ -343,7 +523,9 @@ async function main(): Promise<void> {
     }
   } while (cursor);
 
-  console.log(`done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped}`);
+  console.log(
+    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn}`,
+  );
 }
 
 main().catch((err) => {
