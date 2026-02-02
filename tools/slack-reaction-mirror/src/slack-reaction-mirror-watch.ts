@@ -153,6 +153,23 @@ function matchesWorkflowFromLine(strings: string[], aliases: string[]): boolean 
   return false;
 }
 
+function normalizeForSubstringMatch(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+
+function isStandupReminderMessage(strings: string[]): boolean {
+  const haystack = normalizeForSubstringMatch(strings.join("\n"));
+  if (haystack.includes("daily stand-up meeting reminder")) return true;
+  if (haystack.includes("don't forget to post your update in thread")) return true;
+  if (haystack.includes("dont forget to post your update in thread")) return true;
+  if (haystack.includes("fill form from slack shortcut")) return true;
+  return false;
+}
+
 function shouldSkipMessage(message: unknown, cfg: SkipConfig): { skip: boolean; reason?: string } {
   if (typeof message === "object" && message !== null) {
     const anyMsg = message as { user?: unknown };
@@ -160,6 +177,7 @@ function shouldSkipMessage(message: unknown, cfg: SkipConfig): { skip: boolean; 
   }
 
   const strings = messageContentStrings(message);
+  if (isStandupReminderMessage(strings)) return { skip: true, reason: "standup_reminder" };
   if (matchesWorkflowFromLineMention(strings, cfg.skipUserId)) return { skip: true, reason: "workflow_from_line_user_id" };
   if (matchesWorkflowFromLine(strings, cfg.skipUserAliases)) return { skip: true, reason: "workflow_from_line_alias" };
 
