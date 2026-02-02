@@ -247,6 +247,12 @@ function normalizeReactionName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+function canonicalizeReactionName(name: string): string {
+  // Slack skin tone variants appear as e.g. "raised_hands::skin-tone-2".
+  // Treat them as the same base emoji when deciding what to add.
+  return name.replace(/::skin-tone-\\d+/g, "").replace(/:skin-tone-\\d+/g, "");
+}
+
 function isReactionBlocked(name: string, cfg: ReactionFilterConfig): boolean {
   const normalized = normalizeReactionName(name);
   if (cfg.blacklistExact.has(normalized)) return true;
@@ -366,35 +372,42 @@ async function mirrorReactionsForMessage(opts: {
   const reactions = message?.reactions ?? [];
   if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedBlacklisted: 0 };
 
+  const canonicalHasAuthedReaction = new Set<string>();
+  const canonicals = new Set<string>();
+  for (const reaction of reactions) {
+    const name = reaction.name;
+    if (!name) continue;
+    const canonical = canonicalizeReactionName(name);
+    canonicals.add(canonical);
+    if (reaction.users?.includes(authedUserId)) canonicalHasAuthedReaction.add(canonical);
+  }
+
   let added = 0;
   let skippedAlreadyReacted = 0;
   let skippedBlacklisted = 0;
 
-  for (const reaction of reactions) {
-    const name = reaction.name;
-    if (!name) continue;
-
-    if (isReactionBlocked(name, reactionFilterCfg)) {
-      skippedBlacklisted += 1;
-      if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${name}: for ${channel} @ ${messageTs}`);
-      continue;
-    }
-
-    const users = reaction.users ?? [];
-    if (users.includes(authedUserId)) {
+  for (const canonical of canonicals) {
+    if (canonicalHasAuthedReaction.has(canonical)) {
       skippedAlreadyReacted += 1;
       continue;
     }
 
+    const addName = canonical; // always add the base emoji (no skin tone)
+    if (isReactionBlocked(addName, reactionFilterCfg)) {
+      skippedBlacklisted += 1;
+      if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${addName}: for ${channel} @ ${messageTs}`);
+      continue;
+    }
+
     if (dryRun) {
-      console.log(`[dry-run] add :${name}: to ${channel} @ ${messageTs}`);
+      console.log(`[dry-run] add :${addName}: to ${channel} @ ${messageTs}`);
       added += 1;
       continue;
     }
 
     try {
-      await withRateLimitRetry(() => client.reactions.add({ name, channel, timestamp: messageTs }));
-      console.log(`added :${name}: to ${channel} @ ${messageTs}`);
+      await withRateLimitRetry(() => client.reactions.add({ name: addName, channel, timestamp: messageTs }));
+      console.log(`added :${addName}: to ${channel} @ ${messageTs}`);
       added += 1;
     } catch (err) {
       const anyErr = err as { data?: { error?: string } };

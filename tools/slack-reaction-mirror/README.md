@@ -69,6 +69,7 @@ npm run start -- --channel G12345678 --oldest 2026-01-29
 
 - By default skips messages with no reactions. With `--add-default-reactions`, it will add default reactions to messages that have none.
 - For each emoji reaction on a message, if you have not reacted yet, it adds that emoji reaction from your account.
+- Skin tone variants are treated as the same base emoji (e.g. `raised_hands` vs `raised_hands::skin-tone-2`), and the tool will add the base emoji (no skin tone).
 - If a reaction is blacklisted via `SLACK_REACTION_BLACKLIST*`, it will never be added (including default reactions).
 - Skips the daily stand-up reminder message (`Daily stand-up meeting reminder`) so it doesn’t get reactions.
 - Skips mirroring reactions onto messages authored by you.
