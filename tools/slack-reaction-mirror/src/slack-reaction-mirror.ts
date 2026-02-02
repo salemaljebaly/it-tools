@@ -373,13 +373,12 @@ async function mirrorReactionsForMessage(opts: {
   if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedBlacklisted: 0 };
 
   const canonicalHasAuthedReaction = new Set<string>();
-  const canonicalToAddName = new Map<string, string>();
+  const canonicals = new Set<string>();
   for (const reaction of reactions) {
     const name = reaction.name;
     if (!name) continue;
     const canonical = canonicalizeReactionName(name);
-    if (!canonicalToAddName.has(canonical)) canonicalToAddName.set(canonical, name);
-    if (name === canonical) canonicalToAddName.set(canonical, canonical); // prefer base emoji if present
+    canonicals.add(canonical);
     if (reaction.users?.includes(authedUserId)) canonicalHasAuthedReaction.add(canonical);
   }
 
@@ -387,13 +386,14 @@ async function mirrorReactionsForMessage(opts: {
   let skippedAlreadyReacted = 0;
   let skippedBlacklisted = 0;
 
-  for (const [canonical, addName] of canonicalToAddName.entries()) {
+  for (const canonical of canonicals) {
     if (canonicalHasAuthedReaction.has(canonical)) {
       skippedAlreadyReacted += 1;
       continue;
     }
 
-    if (isReactionBlocked(addName, reactionFilterCfg) || isReactionBlocked(canonical, reactionFilterCfg)) {
+    const addName = canonical; // always add the base emoji (no skin tone)
+    if (isReactionBlocked(addName, reactionFilterCfg)) {
       skippedBlacklisted += 1;
       if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${addName}: for ${channel} @ ${messageTs}`);
       continue;

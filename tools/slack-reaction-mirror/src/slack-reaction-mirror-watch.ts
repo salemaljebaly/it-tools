@@ -329,14 +329,14 @@ async function main(): Promise<void> {
       });
       if (alreadyReactedAnyVariant) return;
 
-      await withRateLimitRetry(() => web.reactions.add({ name: reaction, channel, timestamp: ts }));
+      await withRateLimitRetry(() => web.reactions.add({ name: canonicalReaction, channel, timestamp: ts }));
       // eslint-disable-next-line no-console
-      console.log(`added :${reaction}: to ${channel} @ ${ts}`);
+      console.log(`added :${canonicalReaction}: to ${channel} @ ${ts}`);
     } catch (err) {
       const anyErr = err as { data?: { error?: string } };
       if (anyErr?.data?.error === "already_reacted") return;
       // eslint-disable-next-line no-console
-      console.error(`failed to add :${reaction}: to ${channel} @ ${ts}`, err);
+      console.error(`failed to add :${canonicalReaction}: to ${channel} @ ${ts}`, err);
     }
   });
 
