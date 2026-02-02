@@ -38,6 +38,7 @@ Then edit `.env`:
 - Optionally set `SLACK_CHANNEL_ID` to limit to one channel
 - Optionally set `SLACK_MY_USER_ID` to skip reacting on messages authored by you
 - For Workflow Builder messages posted by an app user, optionally set `SLACK_SKIP_MESSAGE_REGEX` or `SLACK_SKIP_MESSAGE_CONTAINS` to skip “your” messages based on content (e.g. a `from:` line).
+- Optionally set `SLACK_REACTION_BLACKLIST`, `SLACK_REACTION_BLACKLIST_CONTAINS`, or `SLACK_REACTION_BLACKLIST_REGEX` to prevent adding specific reactions (supports comma-separated values or a JSON array string).
 
 ## Run
 
@@ -68,6 +69,7 @@ npm run start -- --channel G12345678 --oldest 2026-01-29
 
 - By default skips messages with no reactions. With `--add-default-reactions`, it will add default reactions to messages that have none.
 - For each emoji reaction on a message, if you have not reacted yet, it adds that emoji reaction from your account.
+- If a reaction is blacklisted via `SLACK_REACTION_BLACKLIST*`, it will never be added (including default reactions).
 - Skips mirroring reactions onto messages authored by you.
 - For Workflow Builder / app-posted standups, it can also skip messages that *mention you* (`<@U...>`) or match `SLACK_SKIP_MESSAGE_REGEX` / `SLACK_SKIP_MESSAGE_CONTAINS`.
 - Handles Slack rate limits (429) by sleeping and retrying.

@@ -36,6 +36,22 @@ function parseCommaList(value: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
+function parseListOrJsonArray(value: string | undefined): string[] {
+  if (!value) return [];
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) {
+        return parsed.map((s) => s.trim()).filter((s) => s.length > 0);
+      }
+    } catch {
+      // fall back to comma list
+    }
+  }
+  return parseCommaList(trimmed);
+}
+
 function escapeRegexLiteral(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -85,6 +101,9 @@ function usage(): string {
     "  SLACK_SKIP_MESSAGE_CONTAINS      Optional comma-separated substrings to skip messages (case-insensitive)",
     "  SLACK_DEBUG_SKIP                 Optional: set to 1 to log why messages are skipped",
     "  SLACK_DEFAULT_REACTIONS          Optional comma-separated emoji names to use with --add-default-reactions",
+    "  SLACK_REACTION_BLACKLIST         Optional: comma-separated (or JSON array) emoji names to never add",
+    "  SLACK_REACTION_BLACKLIST_CONTAINS Optional: comma-separated (or JSON array) substrings; blocks any emoji containing them (e.g. woman,girl)",
+    "  SLACK_REACTION_BLACKLIST_REGEX   Optional regex (case-insensitive) matched against emoji names",
     "",
     "Example:",
     "  cp .env.example .env",
@@ -217,6 +236,25 @@ type SkipConfig = {
   debugSkip: boolean;
 };
 
+type ReactionFilterConfig = {
+  blacklistExact: Set<string>;
+  blacklistContains: string[];
+  blacklistRegex?: RegExp;
+  debug: boolean;
+};
+
+function normalizeReactionName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function isReactionBlocked(name: string, cfg: ReactionFilterConfig): boolean {
+  const normalized = normalizeReactionName(name);
+  if (cfg.blacklistExact.has(normalized)) return true;
+  if (cfg.blacklistContains.some((s) => normalized.includes(s))) return true;
+  if (cfg.blacklistRegex && cfg.blacklistRegex.test(normalized)) return true;
+  return false;
+}
+
 function messageContentStrings(message: unknown): string[] {
   const out: string[] = [];
   collectStrings(message, out, { maxDepth: 8, maxStrings: 600 });
@@ -288,31 +326,39 @@ async function mirrorReactionsForMessage(opts: {
   messageTs: string;
   authedUserId: string;
   skipCfg: SkipConfig;
+  reactionFilterCfg: ReactionFilterConfig;
   dryRun: boolean;
-}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number }> {
-  const { client, channel, messageTs, authedUserId, skipCfg, dryRun } = opts;
+}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number; skippedBlacklisted: number }> {
+  const { client, channel, messageTs, authedUserId, skipCfg, reactionFilterCfg, dryRun } = opts;
 
   const res = await withRateLimitRetry(() => client.reactions.get({ channel, timestamp: messageTs, full: true }));
   const message = res.message as
     | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
     | undefined;
-  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1 };
+  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0 };
 
   const skip = shouldSkipMessage(message, skipCfg);
   if (skip.skip) {
     if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1 };
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0 };
   }
 
   const reactions = message?.reactions ?? [];
-  if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0 };
+  if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedBlacklisted: 0 };
 
   let added = 0;
   let skippedAlreadyReacted = 0;
+  let skippedBlacklisted = 0;
 
   for (const reaction of reactions) {
     const name = reaction.name;
     if (!name) continue;
+
+    if (isReactionBlocked(name, reactionFilterCfg)) {
+      skippedBlacklisted += 1;
+      if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${name}: for ${channel} @ ${messageTs}`);
+      continue;
+    }
 
     const users = reaction.users ?? [];
     if (users.includes(authedUserId)) {
@@ -340,7 +386,7 @@ async function mirrorReactionsForMessage(opts: {
     }
   }
 
-  return { added, skippedAlreadyReacted, skippedOwnMessage: 0 };
+  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedBlacklisted };
 }
 
 async function addDefaultReactionsForMessage(opts: {
@@ -349,30 +395,46 @@ async function addDefaultReactionsForMessage(opts: {
   messageTs: string;
   defaultReactionNames: string[];
   skipCfg: SkipConfig;
+  reactionFilterCfg: ReactionFilterConfig;
   dryRun: boolean;
-}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number; skippedHasReactions: number }> {
-  const { client, channel, messageTs, defaultReactionNames, skipCfg, dryRun } = opts;
+}): Promise<{
+  added: number;
+  skippedAlreadyReacted: number;
+  skippedOwnMessage: number;
+  skippedHasReactions: number;
+  skippedBlacklisted: number;
+}> {
+  const { client, channel, messageTs, defaultReactionNames, skipCfg, reactionFilterCfg, dryRun } = opts;
 
   const res = await withRateLimitRetry(() => client.reactions.get({ channel, timestamp: messageTs, full: true }));
   const message = res.message as
     | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
     | undefined;
-  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 0 };
+  if (!message) {
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 0, skippedBlacklisted: 0 };
+  }
 
   const skip = shouldSkipMessage(message, skipCfg);
   if (skip.skip) {
     if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedHasReactions: 0 };
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedHasReactions: 0, skippedBlacklisted: 0 };
   }
 
   if (message.reactions && message.reactions.length > 0) {
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 1 };
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 1, skippedBlacklisted: 0 };
   }
 
   let added = 0;
   let skippedAlreadyReacted = 0;
+  let skippedBlacklisted = 0;
 
   for (const name of defaultReactionNames) {
+    if (isReactionBlocked(name, reactionFilterCfg)) {
+      skippedBlacklisted += 1;
+      if (reactionFilterCfg.debug) console.log(`[blocklist] skip default :${name}: for ${channel} @ ${messageTs}`);
+      continue;
+    }
+
     if (dryRun) {
       console.log(`[dry-run] add default :${name}: to ${channel} @ ${messageTs}`);
       added += 1;
@@ -393,7 +455,7 @@ async function addDefaultReactionsForMessage(opts: {
     }
   }
 
-  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedHasReactions: 0 };
+  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedHasReactions: 0, skippedBlacklisted };
 }
 
 async function main(): Promise<void> {
@@ -451,6 +513,20 @@ async function main(): Promise<void> {
     envDefaultReactions.length > 0 ? envDefaultReactions : [...BUILTIN_DEFAULT_REACTIONS]
   ).filter((v, i, arr) => arr.indexOf(v) === i);
 
+  const reactionBlacklistExact = parseListOrJsonArray(optionalEnv("SLACK_REACTION_BLACKLIST")).map(normalizeReactionName);
+  const reactionBlacklistContains = parseListOrJsonArray(optionalEnv("SLACK_REACTION_BLACKLIST_CONTAINS")).map(
+    normalizeReactionName,
+  );
+  const reactionBlacklistRegexStr = optionalEnv("SLACK_REACTION_BLACKLIST_REGEX");
+  const reactionBlacklistRegex = reactionBlacklistRegexStr ? new RegExp(reactionBlacklistRegexStr, "i") : undefined;
+
+  const reactionFilterCfg: ReactionFilterConfig = {
+    blacklistExact: new Set(reactionBlacklistExact),
+    blacklistContains: reactionBlacklistContains.filter((v, i, arr) => arr.indexOf(v) === i),
+    blacklistRegex: reactionBlacklistRegex,
+    debug: debugSkip,
+  };
+
   const skipCfg: SkipConfig = {
     skipUserId,
     skipUserAliases: [...baseAliases, ...userInfoAliases].filter((v, i, arr) => arr.indexOf(v) === i),
@@ -480,6 +556,7 @@ async function main(): Promise<void> {
   let totalSkipped = 0;
   let totalSkippedOwn = 0;
   let totalSkippedHasReactions = 0;
+  let totalSkippedBlacklisted = 0;
 
   do {
     const res = await withRateLimitRetry(() =>
@@ -515,12 +592,14 @@ async function main(): Promise<void> {
             messageTs: message.ts,
             defaultReactionNames,
             skipCfg,
+            reactionFilterCfg,
             dryRun: args.dryRun,
           });
           totalAdds += r0.added;
           totalSkipped += r0.skippedAlreadyReacted;
           totalSkippedOwn += r0.skippedOwnMessage;
           totalSkippedHasReactions += r0.skippedHasReactions;
+          totalSkippedBlacklisted += r0.skippedBlacklisted;
 
           if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
             cursor = undefined;
@@ -547,12 +626,14 @@ async function main(): Promise<void> {
                   messageTs: reply.ts,
                   defaultReactionNames,
                   skipCfg,
+                  reactionFilterCfg,
                   dryRun: args.dryRun,
                 });
                 totalAdds += r1.added;
                 totalSkipped += r1.skippedAlreadyReacted;
                 totalSkippedOwn += r1.skippedOwnMessage;
                 totalSkippedHasReactions += r1.skippedHasReactions;
+                totalSkippedBlacklisted += r1.skippedBlacklisted;
 
                 if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
                   cursor = undefined;
@@ -568,11 +649,13 @@ async function main(): Promise<void> {
               messageTs: reply.ts,
               authedUserId,
               skipCfg,
+              reactionFilterCfg,
               dryRun: args.dryRun,
             });
             totalAdds += r.added;
             totalSkipped += r.skippedAlreadyReacted;
             totalSkippedOwn += r.skippedOwnMessage;
+            totalSkippedBlacklisted += r.skippedBlacklisted;
 
             if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
               cursor = undefined;
@@ -590,11 +673,13 @@ async function main(): Promise<void> {
           messageTs: message.ts,
           authedUserId,
           skipCfg,
+          reactionFilterCfg,
           dryRun: args.dryRun,
         });
         totalAdds += r.added;
         totalSkipped += r.skippedAlreadyReacted;
         totalSkippedOwn += r.skippedOwnMessage;
+        totalSkippedBlacklisted += r.skippedBlacklisted;
       } else {
         totalSkippedOwn += 1;
       }
@@ -616,12 +701,14 @@ async function main(): Promise<void> {
                 messageTs: reply.ts,
                 defaultReactionNames,
                 skipCfg,
+                reactionFilterCfg,
                 dryRun: args.dryRun,
               });
               totalAdds += r1.added;
               totalSkipped += r1.skippedAlreadyReacted;
               totalSkippedOwn += r1.skippedOwnMessage;
               totalSkippedHasReactions += r1.skippedHasReactions;
+              totalSkippedBlacklisted += r1.skippedBlacklisted;
 
               if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
                 cursor = undefined;
@@ -637,11 +724,13 @@ async function main(): Promise<void> {
             messageTs: reply.ts,
             authedUserId,
             skipCfg,
+            reactionFilterCfg,
             dryRun: args.dryRun,
           });
           totalAdds += rr.added;
           totalSkipped += rr.skippedAlreadyReacted;
           totalSkippedOwn += rr.skippedOwnMessage;
+          totalSkippedBlacklisted += rr.skippedBlacklisted;
 
           if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
             cursor = undefined;
@@ -658,7 +747,7 @@ async function main(): Promise<void> {
   } while (cursor);
 
   console.log(
-    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn} skipped_has_reactions=${totalSkippedHasReactions}`,
+    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn} skipped_has_reactions=${totalSkippedHasReactions} skipped_blacklisted=${totalSkippedBlacklisted}`,
   );
 }
 
