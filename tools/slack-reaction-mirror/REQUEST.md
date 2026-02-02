@@ -12,6 +12,7 @@ The script runs locally and listens to Slack events in real-time using **Socket 
 - It ignores reactions added by the facilitator to prevent loops.
 - It can be restricted to a single private channel via `SLACK_CHANNEL_ID`.
 - It supports a **reaction blacklist** to prevent adding specific emojis (exact match, substring match, or regex match).
+- It skips the daily stand-up reminder message (`Daily stand-up meeting reminder`) so the reminder stays clean.
 
 ### Config (env)
 

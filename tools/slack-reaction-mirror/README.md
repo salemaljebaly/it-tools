@@ -70,6 +70,7 @@ npm run start -- --channel G12345678 --oldest 2026-01-29
 - By default skips messages with no reactions. With `--add-default-reactions`, it will add default reactions to messages that have none.
 - For each emoji reaction on a message, if you have not reacted yet, it adds that emoji reaction from your account.
 - If a reaction is blacklisted via `SLACK_REACTION_BLACKLIST*`, it will never be added (including default reactions).
+- Skips the daily stand-up reminder message (`Daily stand-up meeting reminder`) so it doesn’t get reactions.
 - Skips mirroring reactions onto messages authored by you.
 - For Workflow Builder / app-posted standups, it can also skip messages that *mention you* (`<@U...>`) or match `SLACK_SKIP_MESSAGE_REGEX` / `SLACK_SKIP_MESSAGE_CONTAINS`.
 - Handles Slack rate limits (429) by sleeping and retrying.
