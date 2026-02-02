@@ -126,6 +126,10 @@ function normalizeReactionName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+function canonicalizeReactionName(name: string): string {
+  return name.replace(/::skin-tone-\\d+/g, "").replace(/:skin-tone-\\d+/g, "");
+}
+
 function isReactionBlocked(name: string, cfg: ReactionFilterConfig): boolean {
   const normalized = normalizeReactionName(name);
   if (cfg.blacklistExact.has(normalized)) return true;
@@ -194,17 +198,15 @@ function shouldSkipMessage(message: unknown, cfg: SkipConfig): { skip: boolean; 
   return { skip: false };
 }
 
-async function getMessage(web: WebClient, channel: string, ts: string): Promise<unknown | undefined> {
-  const res = await withRateLimitRetry(() =>
-    web.conversations.history({
-      channel,
-      oldest: ts,
-      latest: ts,
-      inclusive: true,
-      limit: 1,
-    }),
-  );
-  return res.messages?.[0];
+async function getMessageWithReactions(
+  web: WebClient,
+  channel: string,
+  ts: string,
+): Promise<{ message?: unknown; reactions: Array<{ name?: string; users?: string[] }> }> {
+  const res = await withRateLimitRetry(() => web.reactions.get({ channel, timestamp: ts, full: true }));
+  const msg = (res.message as unknown) ?? undefined;
+  const reactions = (res.message as { reactions?: Array<{ name?: string; users?: string[] }> } | undefined)?.reactions ?? [];
+  return { message: msg, reactions };
 }
 
 async function main(): Promise<void> {
@@ -297,7 +299,8 @@ async function main(): Promise<void> {
     if (!channel || !ts || !reaction || !reactingUser) return;
     if (reactingUser === authedUserId) return; // prevent loops: ignore our own adds
     if (filterChannelId && channel !== filterChannelId) return;
-    if (isReactionBlocked(reaction, reactionFilterCfg)) {
+    const canonicalReaction = canonicalizeReactionName(reaction);
+    if (isReactionBlocked(reaction, reactionFilterCfg) || isReactionBlocked(canonicalReaction, reactionFilterCfg)) {
       if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${reaction}: for ${channel} @ ${ts}`);
       return;
     }
@@ -309,13 +312,22 @@ async function main(): Promise<void> {
         return; // skip reacting on our own messages
       }
 
-      const message = await getMessage(web, channel, ts);
+      const { message, reactions } = await getMessageWithReactions(web, channel, ts);
       if (!message) return;
+
       const skip = shouldSkipMessage(message, skipCfg);
       if (skip.skip) {
         if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${ts} reason=${skip.reason ?? "unknown"}`);
         return;
       }
+
+      const alreadyReactedAnyVariant = reactions.some((r) => {
+        const n = r.name;
+        if (!n) return false;
+        if (canonicalizeReactionName(n) !== canonicalReaction) return false;
+        return (r.users ?? []).includes(authedUserId);
+      });
+      if (alreadyReactedAnyVariant) return;
 
       await withRateLimitRetry(() => web.reactions.add({ name: reaction, channel, timestamp: ts }));
       // eslint-disable-next-line no-console
