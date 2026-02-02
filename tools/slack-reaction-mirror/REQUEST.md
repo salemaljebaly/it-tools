@@ -11,6 +11,13 @@ The script runs locally and listens to Slack events in real-time using **Socket 
 - When anyone adds a reaction to a message in the target channel, the script adds the **same emoji reaction** from the facilitator’s account.
 - It ignores reactions added by the facilitator to prevent loops.
 - It can be restricted to a single private channel via `SLACK_CHANNEL_ID`.
+- It supports a **reaction blacklist** to prevent adding specific emojis (exact match, substring match, or regex match).
+
+### Config (env)
+
+- `SLACK_REACTION_BLACKLIST`: exact emoji names to never add (comma-separated or a JSON array string)
+- `SLACK_REACTION_BLACKLIST_CONTAINS`: substrings to block (e.g. `woman` blocks any emoji name containing `woman`)
+- `SLACK_REACTION_BLACKLIST_REGEX`: regex (case-insensitive) to block by name
 
 ## Where it runs
 
@@ -66,4 +73,3 @@ Optional (if supporting public channels too):
 
 - Workspace admin approval to install the Slack app (if required by policy)
 - Approval for the OAuth scopes listed above
-

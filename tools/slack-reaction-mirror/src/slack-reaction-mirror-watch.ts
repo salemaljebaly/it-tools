@@ -30,6 +30,22 @@ function parseCommaList(value: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
+function parseListOrJsonArray(value: string | undefined): string[] {
+  if (!value) return [];
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) {
+        return parsed.map((s) => s.trim()).filter((s) => s.length > 0);
+      }
+    } catch {
+      // fall back to comma list
+    }
+  }
+  return parseCommaList(trimmed);
+}
+
 function escapeRegexLiteral(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -99,6 +115,25 @@ type SkipConfig = {
   debugSkip: boolean;
 };
 
+type ReactionFilterConfig = {
+  blacklistExact: Set<string>;
+  blacklistContains: string[];
+  blacklistRegex?: RegExp;
+  debug: boolean;
+};
+
+function normalizeReactionName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function isReactionBlocked(name: string, cfg: ReactionFilterConfig): boolean {
+  const normalized = normalizeReactionName(name);
+  if (cfg.blacklistExact.has(normalized)) return true;
+  if (cfg.blacklistContains.some((s) => normalized.includes(s))) return true;
+  if (cfg.blacklistRegex && cfg.blacklistRegex.test(normalized)) return true;
+  return false;
+}
+
 function messageContentStrings(message: unknown): string[] {
   const out: string[] = [];
   collectStrings(message, out, { maxDepth: 8, maxStrings: 600 });
@@ -163,6 +198,12 @@ async function main(): Promise<void> {
   const skipMessageRegexStr = optionalEnv("SLACK_SKIP_MESSAGE_REGEX");
   const skipMessageRegex = skipMessageRegexStr ? new RegExp(skipMessageRegexStr, "i") : undefined;
   const debugSkip = optionalEnv("SLACK_DEBUG_SKIP") === "1";
+  const reactionBlacklistExact = parseListOrJsonArray(optionalEnv("SLACK_REACTION_BLACKLIST")).map(normalizeReactionName);
+  const reactionBlacklistContains = parseListOrJsonArray(optionalEnv("SLACK_REACTION_BLACKLIST_CONTAINS")).map(
+    normalizeReactionName,
+  );
+  const reactionBlacklistRegexStr = optionalEnv("SLACK_REACTION_BLACKLIST_REGEX");
+  const reactionBlacklistRegex = reactionBlacklistRegexStr ? new RegExp(reactionBlacklistRegexStr, "i") : undefined;
 
   const web = new WebClient(slackUserToken);
   const auth = await withRateLimitRetry(() => web.auth.test());
@@ -205,6 +246,13 @@ async function main(): Promise<void> {
     debugSkip,
   };
 
+  const reactionFilterCfg: ReactionFilterConfig = {
+    blacklistExact: new Set(reactionBlacklistExact),
+    blacklistContains: reactionBlacklistContains.filter((v, i, arr) => arr.indexOf(v) === i),
+    blacklistRegex: reactionBlacklistRegex,
+    debug: debugSkip,
+  };
+
   // eslint-disable-next-line no-console
   console.log(
     [
@@ -231,6 +279,10 @@ async function main(): Promise<void> {
     if (!channel || !ts || !reaction || !reactingUser) return;
     if (reactingUser === authedUserId) return; // prevent loops: ignore our own adds
     if (filterChannelId && channel !== filterChannelId) return;
+    if (isReactionBlocked(reaction, reactionFilterCfg)) {
+      if (reactionFilterCfg.debug) console.log(`[blocklist] skip :${reaction}: for ${channel} @ ${ts}`);
+      return;
+    }
 
     try {
       const authorId = event.item_user;
