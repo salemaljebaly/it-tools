@@ -84,6 +84,12 @@ function getRetryAfterSeconds(err: unknown): number | undefined {
   return undefined;
 }
 
+function getSlackApiErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const anyErr = err as { data?: { error?: unknown } };
+  return typeof anyErr.data?.error === "string" ? anyErr.data.error : undefined;
+}
+
 async function withRateLimitRetry<T>(fn: () => Promise<T>): Promise<T> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -333,8 +339,13 @@ async function main(): Promise<void> {
       // eslint-disable-next-line no-console
       console.log(`added :${canonicalReaction}: to ${channel} @ ${ts}`);
     } catch (err) {
-      const anyErr = err as { data?: { error?: string } };
-      if (anyErr?.data?.error === "already_reacted") return;
+      const errorCode = getSlackApiErrorCode(err);
+      if (errorCode === "already_reacted") return;
+      if (errorCode === "too_many_reactions") {
+        // eslint-disable-next-line no-console
+        console.log(`[skip] too_many_reactions for ${channel} @ ${ts}; cannot add :${canonicalReaction}:`);
+        return;
+      }
       // eslint-disable-next-line no-console
       console.error(`failed to add :${canonicalReaction}: to ${channel} @ ${ts}`, err);
     }

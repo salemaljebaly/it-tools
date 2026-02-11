@@ -205,6 +205,12 @@ function getRetryAfterSeconds(err: unknown): number | undefined {
   return undefined;
 }
 
+function getSlackApiErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const anyErr = err as { data?: { error?: unknown } };
+  return typeof anyErr.data?.error === "string" ? anyErr.data.error : undefined;
+}
+
 async function withRateLimitRetry<T>(fn: () => Promise<T>): Promise<T> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -354,23 +360,33 @@ async function mirrorReactionsForMessage(opts: {
   skipCfg: SkipConfig;
   reactionFilterCfg: ReactionFilterConfig;
   dryRun: boolean;
-}): Promise<{ added: number; skippedAlreadyReacted: number; skippedOwnMessage: number; skippedBlacklisted: number }> {
+}): Promise<{
+  added: number;
+  skippedAlreadyReacted: number;
+  skippedOwnMessage: number;
+  skippedBlacklisted: number;
+  skippedTooManyReactions: number;
+}> {
   const { client, channel, messageTs, authedUserId, skipCfg, reactionFilterCfg, dryRun } = opts;
 
   const res = await withRateLimitRetry(() => client.reactions.get({ channel, timestamp: messageTs, full: true }));
   const message = res.message as
     | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
     | undefined;
-  if (!message) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0 };
+  if (!message) {
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0, skippedTooManyReactions: 0 };
+  }
 
   const skip = shouldSkipMessage(message, skipCfg);
   if (skip.skip) {
     if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0 };
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedBlacklisted: 0, skippedTooManyReactions: 0 };
   }
 
   const reactions = message?.reactions ?? [];
-  if (reactions.length === 0) return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedBlacklisted: 0 };
+  if (reactions.length === 0) {
+    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedBlacklisted: 0, skippedTooManyReactions: 0 };
+  }
 
   const canonicalHasAuthedReaction = new Set<string>();
   const canonicals = new Set<string>();
@@ -385,6 +401,7 @@ async function mirrorReactionsForMessage(opts: {
   let added = 0;
   let skippedAlreadyReacted = 0;
   let skippedBlacklisted = 0;
+  let skippedTooManyReactions = 0;
 
   for (const canonical of canonicals) {
     if (canonicalHasAuthedReaction.has(canonical)) {
@@ -410,16 +427,21 @@ async function mirrorReactionsForMessage(opts: {
       console.log(`added :${addName}: to ${channel} @ ${messageTs}`);
       added += 1;
     } catch (err) {
-      const anyErr = err as { data?: { error?: string } };
-      if (anyErr?.data?.error === "already_reacted") {
+      const errorCode = getSlackApiErrorCode(err);
+      if (errorCode === "already_reacted") {
         skippedAlreadyReacted += 1;
+        continue;
+      }
+      if (errorCode === "too_many_reactions") {
+        skippedTooManyReactions += 1;
+        console.log(`[skip] too_many_reactions for ${channel} @ ${messageTs}; cannot add :${addName}:`);
         continue;
       }
       throw err;
     }
   }
 
-  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedBlacklisted };
+  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedBlacklisted, skippedTooManyReactions };
 }
 
 async function addDefaultReactionsForMessage(opts: {
@@ -436,6 +458,7 @@ async function addDefaultReactionsForMessage(opts: {
   skippedOwnMessage: number;
   skippedHasReactions: number;
   skippedBlacklisted: number;
+  skippedTooManyReactions: number;
 }> {
   const { client, channel, messageTs, defaultReactionNames, skipCfg, reactionFilterCfg, dryRun } = opts;
 
@@ -444,22 +467,44 @@ async function addDefaultReactionsForMessage(opts: {
     | { user?: string; text?: string; reactions?: Array<{ name: string; users?: string[] }> }
     | undefined;
   if (!message) {
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 0, skippedBlacklisted: 0 };
+    return {
+      added: 0,
+      skippedAlreadyReacted: 0,
+      skippedOwnMessage: 0,
+      skippedHasReactions: 0,
+      skippedBlacklisted: 0,
+      skippedTooManyReactions: 0,
+    };
   }
 
   const skip = shouldSkipMessage(message, skipCfg);
   if (skip.skip) {
     if (skipCfg.debugSkip) console.log(`[skip] ${channel} @ ${messageTs} reason=${skip.reason ?? "unknown"}`);
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 1, skippedHasReactions: 0, skippedBlacklisted: 0 };
+    return {
+      added: 0,
+      skippedAlreadyReacted: 0,
+      skippedOwnMessage: 1,
+      skippedHasReactions: 0,
+      skippedBlacklisted: 0,
+      skippedTooManyReactions: 0,
+    };
   }
 
   if (message.reactions && message.reactions.length > 0) {
-    return { added: 0, skippedAlreadyReacted: 0, skippedOwnMessage: 0, skippedHasReactions: 1, skippedBlacklisted: 0 };
+    return {
+      added: 0,
+      skippedAlreadyReacted: 0,
+      skippedOwnMessage: 0,
+      skippedHasReactions: 1,
+      skippedBlacklisted: 0,
+      skippedTooManyReactions: 0,
+    };
   }
 
   let added = 0;
   let skippedAlreadyReacted = 0;
   let skippedBlacklisted = 0;
+  let skippedTooManyReactions = 0;
 
   for (const name of defaultReactionNames) {
     if (isReactionBlocked(name, reactionFilterCfg)) {
@@ -479,16 +524,28 @@ async function addDefaultReactionsForMessage(opts: {
       console.log(`added default :${name}: to ${channel} @ ${messageTs}`);
       added += 1;
     } catch (err) {
-      const anyErr = err as { data?: { error?: string } };
-      if (anyErr?.data?.error === "already_reacted") {
+      const errorCode = getSlackApiErrorCode(err);
+      if (errorCode === "already_reacted") {
         skippedAlreadyReacted += 1;
+        continue;
+      }
+      if (errorCode === "too_many_reactions") {
+        skippedTooManyReactions += 1;
+        console.log(`[skip] too_many_reactions for ${channel} @ ${messageTs}; cannot add default :${name}:`);
         continue;
       }
       throw err;
     }
   }
 
-  return { added, skippedAlreadyReacted, skippedOwnMessage: 0, skippedHasReactions: 0, skippedBlacklisted };
+  return {
+    added,
+    skippedAlreadyReacted,
+    skippedOwnMessage: 0,
+    skippedHasReactions: 0,
+    skippedBlacklisted,
+    skippedTooManyReactions,
+  };
 }
 
 async function main(): Promise<void> {
@@ -590,6 +647,7 @@ async function main(): Promise<void> {
   let totalSkippedOwn = 0;
   let totalSkippedHasReactions = 0;
   let totalSkippedBlacklisted = 0;
+  let totalSkippedTooManyReactions = 0;
 
   do {
     const res = await withRateLimitRetry(() =>
@@ -633,6 +691,7 @@ async function main(): Promise<void> {
           totalSkippedOwn += r0.skippedOwnMessage;
           totalSkippedHasReactions += r0.skippedHasReactions;
           totalSkippedBlacklisted += r0.skippedBlacklisted;
+          totalSkippedTooManyReactions += r0.skippedTooManyReactions;
 
           if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
             cursor = undefined;
@@ -667,6 +726,7 @@ async function main(): Promise<void> {
                 totalSkippedOwn += r1.skippedOwnMessage;
                 totalSkippedHasReactions += r1.skippedHasReactions;
                 totalSkippedBlacklisted += r1.skippedBlacklisted;
+                totalSkippedTooManyReactions += r1.skippedTooManyReactions;
 
                 if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
                   cursor = undefined;
@@ -689,6 +749,7 @@ async function main(): Promise<void> {
             totalSkipped += r.skippedAlreadyReacted;
             totalSkippedOwn += r.skippedOwnMessage;
             totalSkippedBlacklisted += r.skippedBlacklisted;
+            totalSkippedTooManyReactions += r.skippedTooManyReactions;
 
             if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
               cursor = undefined;
@@ -713,6 +774,7 @@ async function main(): Promise<void> {
         totalSkipped += r.skippedAlreadyReacted;
         totalSkippedOwn += r.skippedOwnMessage;
         totalSkippedBlacklisted += r.skippedBlacklisted;
+        totalSkippedTooManyReactions += r.skippedTooManyReactions;
       } else {
         totalSkippedOwn += 1;
       }
@@ -742,6 +804,7 @@ async function main(): Promise<void> {
               totalSkippedOwn += r1.skippedOwnMessage;
               totalSkippedHasReactions += r1.skippedHasReactions;
               totalSkippedBlacklisted += r1.skippedBlacklisted;
+              totalSkippedTooManyReactions += r1.skippedTooManyReactions;
 
               if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
                 cursor = undefined;
@@ -764,6 +827,7 @@ async function main(): Promise<void> {
           totalSkipped += rr.skippedAlreadyReacted;
           totalSkippedOwn += rr.skippedOwnMessage;
           totalSkippedBlacklisted += rr.skippedBlacklisted;
+          totalSkippedTooManyReactions += rr.skippedTooManyReactions;
 
           if (args.maxReactionsAdds !== undefined && totalAdds >= args.maxReactionsAdds) {
             cursor = undefined;
@@ -780,7 +844,7 @@ async function main(): Promise<void> {
   } while (cursor);
 
   console.log(
-    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn} skipped_has_reactions=${totalSkippedHasReactions} skipped_blacklisted=${totalSkippedBlacklisted}`,
+    `done: messages=${processedMessages} adds=${totalAdds} skipped_already=${totalSkipped} skipped_own=${totalSkippedOwn} skipped_has_reactions=${totalSkippedHasReactions} skipped_blacklisted=${totalSkippedBlacklisted} skipped_too_many_reactions=${totalSkippedTooManyReactions}`,
   );
 }
 
