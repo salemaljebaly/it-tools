@@ -54,6 +54,10 @@ Then run for real (no `--dry-run`):
 npm run start -- --channel G12345678 --oldest 2026-01-29
 ```
 
+```bash
+npm run start -- --oldest 2026-01-28 --max-messages 100 --max-adds 100 --add-default-reactions 
+```
+
 ## Options
 
 - `--channel <CHANNEL_ID>` private channel ID (starts with `G...` or `C...`) (or set `SLACK_CHANNEL_ID` in `.env`)
