@@ -27,6 +27,11 @@ The script runs locally and listens to Slack events in real-time using **Socket 
 
 ## Slack app requirements
 
+### Slack App
+```
+https://api.slack.com/apps
+```
+
 ### OAuth tokens
 
 1) **User OAuth Token** (`xoxp-...`)
